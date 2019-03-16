@@ -59,6 +59,7 @@ ALIGN 256
 .main
 {
     ; initialize the vgm player with a vgc data stream
+    jsr irq_init
     lda #hi(vgm_stream_buffers)
     ldx #lo(vgm_data)
     ldy #hi(vgm_data)
@@ -66,24 +67,28 @@ ALIGN 256
     jsr vgm_init
 
     ; loop & update
-    sei
 .loop
 
 ; set to false to playback at full speed for performance testing
-IF TRUE 
+IF FALSE
     ; vsync
     lda #2
     .vsync1
     bit &FE4D
     beq vsync1
     sta &FE4D
+ELSE
+    lda #19
+    jsr $fff4
 ENDIF
 
 
     ;ldy#10:.loop0 ldx#0:.loop1 nop:nop:dex:bne loop1:dey:bne loop0
-
+    php
+    sei
     lda #&03:sta&fe21
     jsr vgm_update
+    plp
     pha
     lda #&07:sta&fe21
     pla
@@ -98,7 +103,8 @@ INCLUDE "lib/vgmplayer.asm"
 
 ; include your tune of choice here, some samples provided....
 .vgm_data
-INCBIN "testvgm/ym_009.vgc"
+INCBIN "vgm/ou-bass-quant.vgc"
+;INCBIN "testvgm/ym_009.vgc"
 ;INCBIN "testvgm/song_091.vgc"
 ;INCBIN "testvgm/axelf.vgc"
 ;INCBIN "testvgm/bbcapple.vgc"

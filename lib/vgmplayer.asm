@@ -7,7 +7,10 @@
 ;---------------------------------------------------------------
 ; VGM Player Library code
 ;---------------------------------------------------------------
-
+MASTER=1
+IF MASTER
+	CPU 1
+ENDIF
 .vgm_start
 
 ;--------------------------------------------------
@@ -88,14 +91,13 @@ ENDIF
 
 .more_updates
     lda#7:jsr vgm_update_register1  ; Volume3
-    lda#1:jsr vgm_update_register2  ; Tone1
-    lda#2:jsr vgm_update_register2  ; Tone2
+    lda#1:jsr vgm_update_register2_with_bass  ; Tone1
+    lda#2:jsr vgm_update_register2_with_bass  ; Tone2
+    lda#0:jsr vgm_update_register2_with_bass  ; Tone0
     lda#4:jsr vgm_update_register1  ; Volume0
     lda#5:jsr vgm_update_register1  ; Volume1
     lda#6:jsr vgm_update_register1  ; Volume2
-    ; do tone0 last so we can use X output as the Zero return flag
-    lda#0:jsr vgm_update_register2  ; Tone0, returns 0 in X
-    txa ; return Z=0=still playing
+    lda #0 ; X is no longer zero after sn_write
 .exit
     rts
 
@@ -130,16 +132,48 @@ ENDIF
 ; clobbers X, A is non-zero on exit
 .sn_write
 {
+        tax
+	bpl write
+	and #$e0
+	cmp basschannel
+	bne notbass
+	txa
+        bit sn_attenuation_register_mask
+	beq no ;ignore pitch writes to bass channel
+	; bass volume
+	sta writeval
+.no
+	rts
+.notbass
+	txa
+        bit sn_attenuation_register_mask
+        beq write                                       ; taken if not attenuation register
+	txa
+        and #$f0                                        ; %xrrr0000
+        sta remask+1
+        txa                                                     ; %xrrrvvvv
+        and #$0f                                        ; %0000vvvv
+        tax
+        lda sn_volume_table,x
+.remask:ora #$ff
+.*sn_write_real
+.write
     ldx #255
     stx &fe43
     sta &fe41
+IF MASTER
+    stz &fe40
+ELSE
     inx
     stx &fe40
-    lda &fe40
-    ora #8
+ENDIF
+    lda #8
     sta &fe40
-    rts ; 21 bytes
+    rts
+.sn_attenuation_register_mask:equb $10
 }
+.sn_volume_table:equb 3,4,5,6,7,8,9,10,11,12,13,14,15,15,15,15
+
 
 ; Reset SN76489 sound chip to a default (silent) state
 .sn_reset
@@ -189,7 +223,7 @@ VGM_STREAMS = 8
 .vgm_temp equb 0        ; used by vgm_update_register1()
 .vgm_loop equb 0        ; non zero if tune is to be looped
 .vgm_source equw 0      ; vgm data address
-
+.basschannel equb 0        ; $80,$a0,$c0 or $e0, zero for inactive
 ; 8 counters for VGM register update counters (RLE)
 .vgm_register_counts
     SKIP 8
@@ -239,6 +273,7 @@ VGM_STREAMS = 8
 ; On entry X/Y point to Lo/Hi address of the vgc data
 .vgm_stream_mount
 {
+    stz basschannel
     ; parse data stream
     ; VGC broadly uses LZ4 frame & block formats for convenience
     ; however there are assumptions for format:
@@ -501,6 +536,7 @@ ENDIF
     ; - this prevents the LFSR being reset unnecessarily
     cmp #&ef
     beq skip_tone3
+    sta last_written
     jsr sn_write ; clobbers X
 .skip_tone3
     ; get run length (top 4-bits + 1)
@@ -509,8 +545,12 @@ ENDIF
     lsr a
     lsr a
     lsr a
+IF MASTER
+    inc a
+ELSE
     clc
     adc #1
+ENDIF
     ldx vgm_temp
     sta vgm_register_counts,x
 
@@ -545,11 +585,130 @@ ENDIF
 IF ENABLE_VGM_FX
     ldx vgm_temp ; still contains the stream id from previous call to vgm_update_register1()
     sta vgm_fx+8,x ; store the register (0-2) setting for fx
-ENDIF    
+ENDIF
     jmp sn_write ; clobbers X
 }
 
+; Fetch 2 register bytes (LATCH+DATA) from the encoded stream and send to sound chip (tone0, tone1, tone2)
+; Same parameters as vgm_update_register1
+.vgm_update_register2_with_bass
+{
+    jsr vgm_update_register1    ; returns stream in X if updated, and C=0 if no update needed
+    bcc skip_register_update
 
+    ; decode 2nd byte and send to psg as (DATA)
+    txa
+    jsr vgm_get_register_data
+    bit sixty_four
+    beq not_low_pitch
+    ;jmp sn_write
+    ;brk
+    ; 76489 regs 1...zzzz 11yyyyyy => VIA timer 00yyyyyy zzzz0000
+.low_pitch
+    pha
+    lda last_written ;1...zzzz
+    asl a
+    asl a
+    asl a
+    asl a
+    ora #$06
+    sta $fe66
+    pla
+    and #$3f
+    sta $fe67
+    lda last_written
+    and #$e0
+    cmp basschannel
+    beq already
+    sta basschannel
+    ora #$1f
+    sta writeval
+    lda #$f0
+    sta flip
+    lda basschannel
+    inc a
+    jsr sn_write_real ; set pitch to 1
+    lda #0
+    jsr sn_write_real ; high byte
+    lda #$c0
+    sta $fe6e ; enable IRQ
+    rts
+    ;lda #42
+    ;jmp $ffee
+.already
+    rts
+.sixty_four
+    equb $40
+.not_low_pitch
+    pha
+    lda last_written
+    and #$e0
+    cmp basschannel
+    ;sta $ffff
+    bne notthis
+    ; if bass was previously active on this channel turn it off
+    lda #$40
+    sta $fe6e
+    ;lda #35
+    ;jsr $ffee
+    stz basschannel
+.notthis
+    pla
+IF ENABLE_VGM_FX
+    ldx vgm_temp ; still contains the stream id from previous call to vgm_update_register1()
+    sta vgm_fx+8,x ; store the register (0-2) setting for fx
+ENDIF
+    jmp sn_write ; clobbers X
+}
+
+.irq_init
+{
+	php
+	sei
+        lda $0204
+        sta oldirq+1
+        lda $0205
+        sta oldirq+2
+        lda #<irq
+        sta $204
+        lda #>irq
+        sta $205
+	lda #$7f
+	sta $fe6e
+	lda #$40
+	sta $fe6b
+	lda #1
+	sta $fe64
+	sta $fe65
+	plp
+	rts
+}
+.irq
+	bit $fe6d
+	bvc oldirq
+	bmi us
+.oldirq
+        jmp $ffff
+.us	; our timer hit
+	lda $fe64 ;clear
+	lda #255
+	sta $fe43
+writeval=*+1
+	lda #0
+.flip
+	beq irq_silent
+	ora #$0f
+.irq_silent
+	sta $fe41
+	stz $fe40
+	lda flip
+	eor #$20
+	sta flip
+	lda &fe40
+	lda #8
+	sta $fe40
+	lda $fc
+	rti
 .vgm_end
 
 
@@ -929,7 +1088,8 @@ IF ENABLE_HUFFMAN
     lda &FFFF, Y     ; ** MODIFIED ** See vgm_stream_mount
     rts
 }
-
+.last_written
+    equb 0
 
 ENDIF ; ENABLE_HUFFMAN
 
