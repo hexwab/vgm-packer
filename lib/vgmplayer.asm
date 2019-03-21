@@ -11,6 +11,8 @@ MASTER=1
 IF MASTER
 	CPU 1
 ENDIF
+DEBUG=1
+
 .vgm_start
 
 ;--------------------------------------------------
@@ -83,20 +85,54 @@ ENDIF
     ; Get Channel 3 tone first because that contains the EOF marker
 
     ; Update Tone3
-    lda#3:jsr vgm_update_register1  ; on exit C set if data changed, Y is last value
-    bcc more_updates
-
-    cpy #&08     ; EOF marker? (0x08 is an invalid tone 3 value)
+    lda#3:jsr vgm_update_register1  ; on exit C set if data changed, A is last value
+    bcc no_tone3
+    cmp #&e8       ; EOF marker? (0x08 is an invalid tone 3 value)
     beq finished
-
-.more_updates
+    cmp #$ef       ; check if it's a tone3 skip command (&ef) before we play it
+    beq no_tone3 ; - this prevents the LFSR being reset unnecessarily
+    jsr sn_write
+.no_tone3
     lda#7:jsr vgm_update_register1  ; Volume3
-    lda#1:jsr vgm_update_register2_with_bass  ; Tone1
-    lda#2:jsr vgm_update_register2_with_bass  ; Tone2
-    lda#0:jsr vgm_update_register2_with_bass  ; Tone0
+    bcc no_vol3
+    jsr sn_write_with_attenuation
+.no_vol3
+    lda#0:jsr vgm_update_register2  ; Tone0
+    bcc no_tone0
+    jsr do_tone0
+    ;jsr do_normal_tone
+.no_tone0
+    lda#1:jsr vgm_update_register2  ; Tone1
+    bcc no_tone1
+    jsr do_tone1
+    ;jsr do_normal_tone
+.no_tone1
+    lda#2:jsr vgm_update_register2  ; Tone2
+    bcc no_tone2
+    jsr do_tone2
+    ;jsr do_normal_tone
+.no_tone2
     lda#4:jsr vgm_update_register1  ; Volume0
+    bcc no_vol0
+    sta u1writeval ;tone0_writeval
+    bit bass_flag+0
+    bmi no_vol0
+    jsr sn_write_with_attenuation
+.no_vol0
     lda#5:jsr vgm_update_register1  ; Volume1
+    bcc no_vol1
+    sta u2writeval ;tone1_writeval
+    bit bass_flag+1
+    bmi no_vol1
+    jsr sn_write_with_attenuation
+.no_vol1
     lda#6:jsr vgm_update_register1  ; Volume2
+    bcc no_vol2
+    sta s2writeval ;tone2_writeval
+    bit bass_flag+2
+    bmi no_vol2
+    jsr sn_write_with_attenuation
+.no_vol2
     lda #0 ; X is no longer zero after sn_write
 .exit
     rts
@@ -130,34 +166,19 @@ ENDIF
 ; Write data to SN76489 sound chip
 ; A contains data to be written to sound chip
 ; clobbers X, A is non-zero on exit
-.sn_write
+.sn_write_with_attenuation
 {
-        tax
-	bpl write
-	and #$e0
-	cmp basschannel
-	bne notbass
-	txa
-        bit sn_attenuation_register_mask
-	beq no ;ignore pitch writes to bass channel
-	; bass volume
-	sta writeval
-.no
-	rts
-.notbass
-	txa
-        bit sn_attenuation_register_mask
-        beq write                                       ; taken if not attenuation register
-	txa
-        and #$f0                                        ; %xrrr0000
+	tax
+        and #$f0         ; %xrrr0000
         sta remask+1
-        txa                                                     ; %xrrrvvvv
-        and #$0f                                        ; %0000vvvv
+        txa              ; %xrrrvvvv
+        and #$0f         ; %0000vvvv
         tax
         lda sn_volume_table,x
 .remask:ora #$ff
-.*sn_write_real
-.write
+.*sn_write
+    php
+    sei
     ldx #255
     stx &fe43
     sta &fe41
@@ -167,10 +188,11 @@ ELSE
     inx
     stx &fe40
 ENDIF
+    nop:nop:nop
     lda #8
     sta &fe40
+    plp
     rts
-.sn_attenuation_register_mask:equb $10
 }
 .sn_volume_table:equb 3,4,5,6,7,8,9,10,11,12,13,14,15,15,15,15
 
@@ -223,7 +245,7 @@ VGM_STREAMS = 8
 .vgm_temp equb 0        ; used by vgm_update_register1()
 .vgm_loop equb 0        ; non zero if tune is to be looped
 .vgm_source equw 0      ; vgm data address
-.basschannel equb 0        ; $80,$a0,$c0 or $e0, zero for inactive
+.firstbyte equb 0
 ; 8 counters for VGM register update counters (RLE)
 .vgm_register_counts
     SKIP 8
@@ -239,6 +261,10 @@ VGM_STREAMS = 8
     EQUB &90 + (1<<5)   ; Volume 1
     EQUB &90 + (2<<5)   ; Volume 2
     EQUB &90 + (3<<5)   ; Volume 3
+
+.bass_flag
+    equb 0, 0, 0
+
 
 ; VGC file parsing - Skip to the next block. 
 ; on entry zp_block_data points to current block (header)
@@ -273,7 +299,6 @@ VGM_STREAMS = 8
 ; On entry X/Y point to Lo/Hi address of the vgc data
 .vgm_stream_mount
 {
-    stz basschannel
     ; parse data stream
     ; VGC broadly uses LZ4 frame & block formats for convenience
     ; however there are assumptions for format:
@@ -520,31 +545,21 @@ ENDIF
 
 .vgm_update_register1
 {
-    tax
     clc
+    tax
     dec vgm_register_counts,x ; no effect on C
     bne skip_register_update
 
     ; decode a byte & send to psg
-    stx vgm_temp
+    sta vgm_temp
     jsr vgm_get_register_data
     tay
-    and #&0f
-    ldx vgm_temp
-    ora vgm_register_headers,x
-    ; check if it's a tone3 skip command (&ef) before we play it
-    ; - this prevents the LFSR being reset unnecessarily
-    cmp #&ef
-    beq skip_tone3
-    sta last_written
-    jsr sn_write ; clobbers X
-.skip_tone3
     ; get run length (top 4-bits + 1)
-    tya
     lsr a
     lsr a
     lsr a
     lsr a
+
 IF MASTER
     inc a
 ELSE
@@ -553,18 +568,9 @@ ELSE
 ENDIF
     ldx vgm_temp
     sta vgm_register_counts,x
-
-IF ENABLE_VGM_FX
     tya
     and #&0f
     ora vgm_register_headers,X
-    cmp #&ef ; tone3 skip?
-    beq skip_tone3_fx
-    and #&0f
-    sta vgm_fx,x ; store the register (0-7) setting in fx array
-.skip_tone3_fx
-ENDIF
-
     sec
 }
 .skip_register_update
@@ -578,87 +584,156 @@ ENDIF
 {
     jsr vgm_update_register1    ; returns stream in X if updated, and C=0 if no update needed
     bcc skip_register_update
-
-    ; decode 2nd byte and send to psg as (DATA)
+    sta firstbyte
+    ; decode 2nd byte and return with it
     txa
     jsr vgm_get_register_data
-IF ENABLE_VGM_FX
-    ldx vgm_temp ; still contains the stream id from previous call to vgm_update_register1()
-    sta vgm_fx+8,x ; store the register (0-2) setting for fx
-ENDIF
-    jmp sn_write ; clobbers X
+    sec
+    rts
 }
 
-; Fetch 2 register bytes (LATCH+DATA) from the encoded stream and send to sound chip (tone0, tone1, tone2)
-; Same parameters as vgm_update_register1
-.vgm_update_register2_with_bass
+; A is pitch register: $81, $a1, $c1
+.set_bitbang_pitch
 {
-    jsr vgm_update_register1    ; returns stream in X if updated, and C=0 if no update needed
-    bcc skip_register_update
+    jsr sn_write
+    lda #$00
+    jmp sn_write
+}
 
-    ; decode 2nd byte and send to psg as (DATA)
-    txa
-    jsr vgm_get_register_data
-    bit sixty_four
-    beq not_low_pitch
-    ;jmp sn_write
-    ;brk
-    ; 76489 regs 1...zzzz 11yyyyyy => VIA timer 00yyyyyy zzzz0000
-.low_pitch
-    pha
-    lda last_written ;1...zzzz
+; in: A has second byte. out: A has timer lo, Y has timer hi
+.set_up_timer_values
+{
+    ; mask out bit 6 of data byte
+    and #$3f
+    tay
+    lda firstbyte
     asl a
     asl a
     asl a
     asl a
     ora #$06
-    sta $fe66
-    pla
-    and #$3f
-    sta $fe67
-    lda last_written
-    and #$e0
-    cmp basschannel
-    beq already
-    sta basschannel
-    ora #$1f
-    sta writeval
-    lda #$f0
-    sta flip
-    lda basschannel
-    inc a
-    jsr sn_write_real ; set pitch to 1
-    lda #0
-    jsr sn_write_real ; high byte
-    lda #$c0
-    sta $fe6e ; enable IRQ
     rts
-    ;lda #42
-    ;jmp $ffee
-.already
-    rts
-.sixty_four
-    equb $40
-.not_low_pitch
+}
+
+;in: A has second byte
+.do_tone0
+{
+    cmp #$40 ; bit 7 is always clear
+    bcs do_bass
+    ; bass is now off. was it previously on?
+    bit bass_flag+0
+    bpl do_normal_tone
+    ; turn off IRQ, reset flag
     pha
-    lda last_written
-    and #$e0
-    cmp basschannel
-    ;sta $ffff
-    bne notthis
-    ; if bass was previously active on this channel turn it off
     lda #$40
     sta $fe6e
-    ;lda #35
-    ;jsr $ffee
-    stz basschannel
-.notthis
+    sta $fe6d ; clear
+    stz bass_flag+0
+    lda u1writeval ; restore vol
+    jsr sn_write_with_attenuation
     pla
-IF ENABLE_VGM_FX
-    ldx vgm_temp ; still contains the stream id from previous call to vgm_update_register1()
-    sta vgm_fx+8,x ; store the register (0-2) setting for fx
-ENDIF
-    jmp sn_write ; clobbers X
+    bra do_normal_tone
+.do_bass
+    jsr set_up_timer_values
+    sta $fe66 ; tone0_bass_timer_lo
+    sty $fe67 ; tone0_bass_timer_hi
+    ; is bass already on?
+    bit bass_flag+0
+    bmi alreadyon
+    ; enable timer
+    lda #$c0 ; uservia_timer1
+    sta $fe6e
+    sta bass_flag+0 ; has top bit set
+    lda #$81 ; set period to 1
+    jmp set_bitbang_pitch
+.alreadyon
+    rts
+}
+
+; in: A has second byte
+.do_normal_tone
+{
+    tay
+    lda firstbyte
+    jsr sn_write
+    tya
+    jmp sn_write
+}
+
+;in: A has second byte
+.do_tone1
+{
+    cmp #$40 ; bit 7 is always clear
+    bcs do_bass
+    ; bass is now off. was it previously on?
+    bit bass_flag+1
+    bpl do_normal_tone
+    ; turn off IRQ, reset flag
+    pha
+    lda #$20
+    sta $fe6e
+    lda $fe68 ; clear
+    stz bass_flag+1
+    lda u2writeval ; restore vol
+    jsr sn_write_with_attenuation
+    pla
+    bra do_normal_tone
+.do_bass
+    jsr set_up_timer_values
+    sta u2latchlo ; tone1_bass_timer_lo
+    sty u2latchhi ; tone1_bass_timer_hi
+    ; is bass already on?
+    bit bass_flag+1
+    bmi alreadyon
+    ; enable timer
+    sta $fe68 ; tone1_bass_timer_lo
+    sty $fe69 ; tone1_bass_timer_hi
+    lda #$a0 ; uservia_timer2
+    sta $fe6e
+    sta $fe6d ; force IRQ
+    sta bass_flag+1 ; has top bit set
+    lda #$a1 ; set period to 1
+    jmp set_bitbang_pitch
+.alreadyon
+    rts
+}
+
+;in: A has second byte
+.do_tone2
+{
+    cmp #$40 ; bit 7 is always clear
+    bcs do_bass
+    ; bass is now off. was it previously on?
+    bit bass_flag+2
+    bpl do_normal_tone
+    ; turn off IRQ, reset flag
+    pha
+    lda #$20
+    sta $fe4e
+    lda $fe48 ; clear
+    stz bass_flag+2
+    lda s2writeval ; restore vol
+    jsr sn_write_with_attenuation
+    pla
+    bra do_normal_tone
+.do_bass
+    jsr set_up_timer_values
+    sta s2latchlo ; tone2_bass_timer_lo
+    sty s2latchhi ; tone2_bass_timer_hi
+    ; is bass already on?
+    bit bass_flag+2
+    bmi alreadyon
+    ; enable timer
+    sta $fe48 ; tone1_bass_timer_lo
+    sty $fe49 ; tone1_bass_timer_hi
+    lda #$a0 ; sysvia_timer2
+    sta $fe4e
+    sta $fe4d ; force IRQ
+    sta bass_flag+2 ; has top bit set
+    lda #$c1 ; set period to 1
+    jmp set_bitbang_pitch
+.alreadyon
+    rts
 }
 
 .irq_init
@@ -673,28 +748,78 @@ ENDIF
         sta $204
         lda #>irq
         sta $205
-	lda #$7f
+	lda #$7f ; all interrupts off
 	sta $fe6e
-	lda #$40
-	sta $fe6b
+	lda #$7d ; except sysvia ca2 (vblank)
+	sta $fe4e
+	lda #$40 ; enable continuous interrupts for ut1
+        sta $fe6b
 	lda #1
 	sta $fe64
-	sta $fe65
+        sta $fe65
+	;lda $fe64 ; clear t1
+	lda $fe68 ; clear ut2
+	lda $fe48 ; clear st2
 	plp
 	rts
 }
 .irq
-	bit $fe6d
-	bvc oldirq
-	bmi us
+IF 0
+	lda #0
+	sta $fe21
+ENDIF	
+	lda $fe6d
+	bmi uservia
+.not_uservia
+	lda $fe4d
+	bpl not_sysvia
+	and $fe4e
+	bit #$20
+	bne sysvia_timer2
+IF 0
+	bit #$02
+	beq sysvia_not_ca2
+	pha
+	phx
+	phy
+	jsr vgm_update
+	ply
+	plx
+	pla
+.sysvia_not_ca2
+ENDIF
+.sysvia_timer1 ; we don't use sysvia timer1
+	;brk
+.not_sysvia
 .oldirq
         jmp $ffff
-.us	; our timer hit
-	lda $fe64 ;clear
+.sysvia_timer2
+IF DEBUG
+    lda #&05:sta&fe21
+ENDIF
+IF DEBUG
+{
+	bit bass_flag+2
+	bmi ok
+	brk
+.ok
+}
+ENDIF
+s2latchlo=*+1
+	lda #0
+	;adc $fe48
+	sta $fe48
+s2latchhi=*+1
+	lda #0
+	;bcs nosub
+	;dec a
+;.nosub
+	sta $fe49
 	lda #255
 	sta $fe43
-writeval=*+1
-	lda #0
+s2writeval=*+1
+	lda #$df
+{
 .flip
 	beq irq_silent
 	ora #$0f
@@ -704,11 +829,108 @@ writeval=*+1
 	lda flip
 	eor #$20
 	sta flip
-	lda &fe40
 	lda #8
 	sta $fe40
+IF DEBUG
+    lda #&07:sta&fe21
+ENDIF
+;jmp oldirq
 	lda $fc
 	rti
+}
+	;brk
+	;jmp oldirq
+
+.uservia
+	and $fe6e
+	bit #$40
+	bne uservia_timer1
+IF DEBUG
+	bit #$20
+	bne uservia_timer2
+	brk
+ENDIF
+.uservia_timer2
+IF DEBUG
+    lda #&06:sta&fe21
+ENDIF
+IF DEBUG
+{
+	bit bass_flag+1
+	bmi ok
+	brk
+.ok
+}
+ENDIF
+u2latchlo=*+1
+	lda #0
+	;adc $fe68
+	sta $fe68
+u2latchhi=*+1
+	lda #0
+	;bcs nosub
+	;dec a
+;.nosub
+	sta $fe69
+	lda #255
+	sta $fe43
+u2writeval=*+1
+	lda #0
+{
+.flip
+	beq irq_silent
+	ora #$0f
+.irq_silent
+	sta $fe41
+	stz $fe40
+	lda flip
+	eor #$20
+	sta flip
+	lda #8
+	sta $fe40
+IF DEBUG
+    lda #&07:sta&fe21
+ENDIF
+;jmp oldirq
+	lda $fc
+	rti
+}
+.uservia_timer1
+IF DEBUG
+    lda #&02:sta&fe21
+ENDIF
+IF DEBUG
+{
+	bit bass_flag+0
+	bmi ok
+	brk
+	.ok
+}
+ENDIF
+	lda $fe64 ;clear
+	lda #255
+	sta $fe43
+u1writeval=*+1
+{
+	lda #$9f
+.flip
+	beq irq_silent
+	ora #$0f
+.irq_silent
+	sta $fe41
+	stz $fe40
+	lda flip
+	eor #$20
+	sta flip
+	lda #8
+	sta $fe40
+IF DEBUG
+    lda #&07:sta&fe21
+ENDIF
+;jmp oldirq
+	lda $fc
+	rti
+}
 .vgm_end
 
 
