@@ -102,7 +102,7 @@ class VgmPacker:
 			if verbose:
 				print("packet_size=" + str(packet_size))
 			n += 1
-			if packet_size == 255:
+			if packet_size == 255 or packet_size == 0:
 				Packet = False
 			else:
 				for x in range(packet_size):

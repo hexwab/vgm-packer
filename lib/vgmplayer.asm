@@ -11,8 +11,9 @@ MASTER=1
 IF MASTER
 	CPU 1
 ENDIF
-DEBUG=1
-
+DEBUG=0
+RASTERS=1
+NO_IRQ=0	
 .vgm_start
 
 ;--------------------------------------------------
@@ -750,10 +751,11 @@ ENDIF
         sta $205
 	lda #$7f ; all interrupts off
 	sta $fe6e
-	lda #$7d ; except sysvia ca2 (vblank)
+	lda #$7F ; except sysvia ca1 (vblank)
 	sta $fe4e
 	lda #$40 ; enable continuous interrupts for ut1
         sta $fe6b
+        sta $fe4b
 	lda #1
 	sta $fe64
         sta $fe65
@@ -763,8 +765,16 @@ ENDIF
 	plp
 	rts
 }
+MACRO IRET
+IF NO_IRQ
+	rts
+ELSE
+	lda $fc
+	rti
+ENDIF
+ENDMACRO
 .irq
-IF 0
+IF RASTERS
 	lda #0
 	sta $fe21
 ENDIF	
@@ -791,10 +801,18 @@ ENDIF
 .sysvia_timer1 ; we don't use sysvia timer1
 	;brk
 .not_sysvia
+.do_oldirq
+IF RASTERS
+	lda #7
+	sta $fe21
+ENDIF
+IF NO_IRQ
+	rts
+ENDIF
 .oldirq
         jmp $ffff
 .sysvia_timer2
-IF DEBUG
+IF RASTERS
     lda #&05:sta&fe21
 ENDIF
 IF DEBUG
@@ -831,12 +849,10 @@ s2writeval=*+1
 	sta flip
 	lda #8
 	sta $fe40
-IF DEBUG
+IF RASTERS
     lda #&07:sta&fe21
 ENDIF
-;jmp oldirq
-	lda $fc
-	rti
+	IRET
 }
 	;brk
 	;jmp oldirq
@@ -851,7 +867,7 @@ IF DEBUG
 	brk
 ENDIF
 .uservia_timer2
-IF DEBUG
+IF RASTERS
     lda #&06:sta&fe21
 ENDIF
 IF DEBUG
@@ -888,15 +904,14 @@ u2writeval=*+1
 	sta flip
 	lda #8
 	sta $fe40
-IF DEBUG
+IF RASTERS
     lda #&07:sta&fe21
 ENDIF
 ;jmp oldirq
-	lda $fc
-	rti
+	IRET
 }
 .uservia_timer1
-IF DEBUG
+IF RASTERS
     lda #&02:sta&fe21
 ENDIF
 IF DEBUG
@@ -924,12 +939,10 @@ u1writeval=*+1
 	sta flip
 	lda #8
 	sta $fe40
-IF DEBUG
+IF RASTERS
     lda #&07:sta&fe21
 ENDIF
-;jmp oldirq
-	lda $fc
-	rti
+	IRET
 }
 .vgm_end
 
@@ -1310,8 +1323,6 @@ IF ENABLE_HUFFMAN
     lda &FFFF, Y     ; ** MODIFIED ** See vgm_stream_mount
     rts
 }
-.last_written
-    equb 0
 
 ENDIF ; ENABLE_HUFFMAN
 
